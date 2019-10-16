@@ -183,6 +183,9 @@ class PaypalProvider(BasicProvider):
             CENTS, rounding=ROUND_HALF_UP)
         data = {
             'intent': 'sale' if self._capture else 'authorize',
+            'application_context': {
+                'shipping_preference': 'NO_SHIPPING',
+            },
             'transactions': [{'amount': {
                 'total': str(total),
                 'currency': payment.currency,
