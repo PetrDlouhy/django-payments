@@ -197,6 +197,9 @@ class PaypalProvider(BasicProvider):
         delivery = payment.delivery.quantize(CENTS, rounding=ROUND_HALF_UP)
         return {
             "intent": "sale" if self._capture else "authorize",
+            "application_context": {
+                "shipping_preference": "NO_SHIPPING",
+            },
             "transactions": [
                 {
                     "amount": {
