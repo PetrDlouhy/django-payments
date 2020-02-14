@@ -50,13 +50,14 @@ class BasicProvider:
         """The `action` for the HTML form element."""
         return self.get_return_url(payment)
 
-    def __init__(self, capture=True):
+    def __init__(self, capture=True, label=""):
         """Create a new provider instance.
 
         This method should not be called directly; use :func:`provider_factory`
         instead.
         """
         self._capture = capture
+        self._label = label
 
     def get_hidden_fields(self, payment):
         '''
