@@ -149,29 +149,32 @@ class BasePayment(models.Model):
     def get_user_email(self):
         """ Get user email """
         try:
+            # Most common implementation
             return self.get_user().email
         except AttributeError:
-            return None
+            raise NotImplementedError()
 
     def get_user_first_name(self):
         """
-        Get user first name
+        Get user first name for purposes of the payment provider
         Used only by PayU provider for now
         """
         try:
+            # Most common implementation
             return self.get_user().first_name
         except AttributeError:
-            return None
+            raise NotImplementedError()
 
     def get_user_last_name(self):
         """
-        Get user last name
+        Get user last name for purposes of the payment provider
         Used only by PayU provider for now
         """
         try:
+            # Most common implementation
             return self.get_user().last_name
         except AttributeError:
-            return None
+            raise NotImplementedError()
 
     def get_renew_token(self):
         """
