@@ -4,6 +4,7 @@ Changelog
 This file contains a brief summary of new features and dependency changes or
 releases, in reverse chronological order.
 
+<<<<<<< HEAD
 v4.1.0
 ------
 
@@ -36,6 +37,23 @@ v4.1.0
 - All changes are backward compatible
 - Existing providers continue working without modifications
 - New methods have sensible defaults (return None, raise NotImplementedError)
+=======
+v4.1.0 (unreleased)
+-------------------
+
+**Breaking Changes**
+
+- Webhook error responses in ``static_callback`` endpoint now return JSON instead of raising
+  ``Http404``. Error responses include ``variant`` and ``error_code`` fields for easier debugging.
+  This helps developers identify which payment provider is having issues when viewing webhook
+  logs in provider dashboards (Stripe, PayPal, etc.).
+
+  **Migration guide:**
+    - If you're using webhook systems (Stripe, PayPal, etc.), no changes needed - they expect JSON.
+    - If you have custom code checking for ``Http404`` exceptions from webhook endpoints, update
+      to handle JSON responses with appropriate HTTP status codes (400, 404, etc.).
+    - Payment tokens are no longer exposed in 404 error responses for security.
+>>>>>>> bbf3cb41 (feat: Return JSON error responses from webhook endpoints)
 
 v4.0.0
 ------
