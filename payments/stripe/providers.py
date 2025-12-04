@@ -68,6 +68,12 @@ stripe_enabled_events: list = [
     "checkout.session.completed",
 ]
 
+stripe_payment_intent_events: list = [
+    "payment_intent.succeeded",
+    "payment_intent.payment_failed",
+    "payment_intent.requires_action",
+]
+
 
 class StripeProviderV3(BasicProvider):
     """Provider backend using `Stripe <https://stripe.com/>`_ api version 3.
@@ -76,6 +82,8 @@ class StripeProviderV3(BasicProvider):
     :param use_token: Use instance.token instead of instance.pk in client_reference_id
     :param endpoint_secret: Endpoint Signing Secret.
     :param secure_endpoint: Validate the recieved data, useful for development.
+    :param recurring_payments: Enable wallet-based recurring payments (server-initiated).
+    :param store_payment_method: Store PaymentMethod for future use.
     """
 
     form_class = BasePaymentForm
@@ -86,6 +94,8 @@ class StripeProviderV3(BasicProvider):
         use_token=True,
         endpoint_secret=None,
         secure_endpoint=True,
+        recurring_payments=False,
+        store_payment_method=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -93,6 +103,8 @@ class StripeProviderV3(BasicProvider):
         self.use_token = use_token
         self.endpoint_secret = endpoint_secret
         self.secure_endpoint = secure_endpoint
+        self.recurring_payments = recurring_payments
+        self.store_payment_method = store_payment_method or recurring_payments
 
     def get_form(self, payment, data=None):
         if not payment.transaction_id:
@@ -122,6 +134,13 @@ class StripeProviderV3(BasicProvider):
                 "cancel_url": payment.get_failure_url(),
                 "client_reference_id": payment.token if self.use_token else payment.pk,
             }
+
+            # Enable payment method storage for recurring payments
+            if self.store_payment_method:
+                session_data["payment_intent_data"] = {
+                    "setup_future_usage": "off_session",
+                }
+
             # Patch session with billing email if exists
             if payment.billing_email:
                 session_data.update({"customer_email": payment.billing_email})
@@ -237,13 +256,103 @@ class StripeProviderV3(BasicProvider):
                 message="client_reference_id is not present, check Stripe Dashboard.",
             ) from e
 
+    def autocomplete_with_wallet(self, payment):
+        """
+        Complete payment using stored PaymentMethod (server-initiated recurring payment).
+
+        This method charges a stored payment method without user interaction.
+        If 3D Secure or other authentication is required, raises RedirectNeeded.
+        """
+        stripe.api_key = self.api_key
+
+        # Get stored PaymentMethod token
+        payment_method_id = payment.get_renew_token()
+        if not payment_method_id:
+            raise PaymentError("No payment method token found for recurring payment")
+
+        try:
+            # Create PaymentIntent with stored PaymentMethod
+            intent = stripe.PaymentIntent.create(
+                amount=self.convert_amount(payment.currency, payment.total),
+                currency=payment.currency.lower(),
+                payment_method=payment_method_id,
+                confirm=True,  # Immediately attempt to charge
+                off_session=True,  # Server-initiated, user not present
+                metadata={
+                    "payment_token": payment.token,
+                    "payment_id": payment.pk if not self.use_token else None,
+                },
+            )
+
+            payment.transaction_id = intent.id
+            payment.attrs.payment_intent = intent
+            payment.save()
+
+            # Handle immediate response
+            if intent.status == "succeeded":
+                payment.captured_amount = payment.total
+                payment.change_status(PaymentStatus.CONFIRMED)
+                self._finalize_wallet_payment(payment)
+
+            elif intent.status == "requires_action":
+                # 3D Secure or other authentication needed
+                if intent.next_action and intent.next_action.type == "redirect_to_url":
+                    redirect_url = intent.next_action.redirect_to_url.url
+                    raise RedirectNeeded(redirect_url)
+                else:
+                    raise PaymentError(f"Payment requires action: {intent.next_action}")
+
+            elif intent.status in ["requires_payment_method", "canceled"]:
+                # Payment failed
+                error_message = "Payment failed"
+                if intent.last_payment_error:
+                    error_message = intent.last_payment_error.message
+                payment.change_status(PaymentStatus.REJECTED, error_message)
+
+            else:
+                # Other status (processing, requires_capture, etc.)
+                payment.change_status(PaymentStatus.WAITING)
+
+        except stripe.error.CardError as e:
+            # Card was declined
+            payment.change_status(PaymentStatus.REJECTED, str(e))
+            raise PaymentError(f"Card declined: {e}") from e
+
+        except stripe.error.StripeError as e:
+            # Other Stripe error
+            payment.change_status(PaymentStatus.ERROR, str(e))
+            raise PaymentError(f"Stripe error: {e}") from e
+
+    def erase_wallet(self, wallet):
+        """
+        Detach PaymentMethod from customer (if applicable).
+
+        This prevents the payment method from being charged again.
+        """
+        stripe.api_key = self.api_key
+
+        if wallet.token:
+            try:
+                payment_method = stripe.PaymentMethod.retrieve(wallet.token)
+                # Only detach if attached to a customer
+                if hasattr(payment_method, "customer") and payment_method.customer:
+                    payment_method.detach()
+            except stripe.error.StripeError:
+                # Payment method doesn't exist or already detached
+                pass
+
+        super().erase_wallet(wallet)
+
     def process_data(self, payment, request):
         """Processes the event sent by stripe.
 
         Updates the payment status and adds the event to the attrs property
         """
         event = self.return_event_payload(request)
-        if event.get("type") in stripe_enabled_events:
+        event_type = event.get("type")
+
+        # Handle Checkout Session events (one-time payments)
+        if event_type in stripe_enabled_events:
             try:
                 session_info = event["data"]["object"]
             except Exception as e:
@@ -259,6 +368,97 @@ class StripeProviderV3(BasicProvider):
                 # Paid Order
                 payment.change_status(PaymentStatus.CONFIRMED)
 
+                # Store PaymentMethod for recurring payments
+                if self.store_payment_method and hasattr(payment, "set_renew_token"):
+                    self._store_payment_method_from_session(payment, session_info)
+
             payment.attrs.session = session_info
             payment.save()
+
+        # Handle PaymentIntent events (recurring payments)
+        elif event_type in stripe_payment_intent_events:
+            return self._process_payment_intent_webhook(payment, event)
+
+        return JsonResponse({"status": "OK"})
+
+    def _store_payment_method_from_session(self, payment, session_info):
+        """
+        Extract and store PaymentMethod from successful Checkout Session.
+        """
+        stripe.api_key = self.api_key
+
+        try:
+            # Get PaymentIntent from session
+            payment_intent_id = session_info.get("payment_intent")
+            if not payment_intent_id:
+                return
+
+            payment_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
+            payment_method_id = payment_intent.payment_method
+
+            if not payment_method_id:
+                return
+
+            # Get PaymentMethod details
+            payment_method = stripe.PaymentMethod.retrieve(payment_method_id)
+
+            # Extract card details
+            card_data = {}
+            if payment_method.type == "card" and payment_method.card:
+                card_data = {
+                    "card_expire_year": payment_method.card.exp_year,
+                    "card_expire_month": payment_method.card.exp_month,
+                    "card_masked_number": payment_method.card.last4,
+                }
+
+            # Store token
+            payment.set_renew_token(
+                token=payment_method_id,
+                automatic_renewal=True,
+                **card_data,
+            )
+
+        except stripe.error.StripeError:
+            # Failed to retrieve payment method, but payment was successful
+            # Don't fail the payment, just skip storing the method
+            pass
+
+    def _process_payment_intent_webhook(self, payment, event):
+        """
+        Handle PaymentIntent webhooks for recurring payments.
+        """
+        try:
+            intent = event["data"]["object"]
+        except Exception as e:
+            raise PaymentError(
+                code=400, message="payment_intent not present in webhook"
+            ) from e
+
+        # Verify this is our payment
+        if payment.transaction_id != intent.id:
+            return JsonResponse({"status": "OK", "message": "Payment ID mismatch"})
+
+        event_type = event.get("type")
+
+        if event_type == "payment_intent.succeeded":
+            payment.captured_amount = payment.total
+            payment.change_status(PaymentStatus.CONFIRMED)
+            payment.attrs.payment_intent = intent
+            payment.save()
+            self._finalize_wallet_payment(payment)
+
+        elif event_type == "payment_intent.payment_failed":
+            error_message = "Payment failed"
+            if intent.get("last_payment_error"):
+                error_message = intent["last_payment_error"].get("message", error_message)
+            payment.change_status(PaymentStatus.REJECTED, error_message)
+            payment.attrs.payment_intent = intent
+            payment.save()
+
+        elif event_type == "payment_intent.requires_action":
+            # Payment requires user action (3DS)
+            payment.change_status(PaymentStatus.INPUT)
+            payment.attrs.payment_intent = intent
+            payment.save()
+
         return JsonResponse({"status": "OK"})
