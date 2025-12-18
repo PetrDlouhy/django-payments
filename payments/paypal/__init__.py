@@ -32,6 +32,60 @@ class UnauthorizedRequest(Exception):
     pass
 
 
+class PaypalApiError(PaymentError):
+    """PayPal API error with detailed error information.
+
+    This exception extends PaymentError with structured error details from PayPal's API,
+    enabling programmatic error handling for different error scenarios.
+
+    Attributes:
+        message: Human-readable error message
+        status_code: HTTP status code (400, 401, 404, etc.)
+        error_name: PayPal error name (e.g., 'RESOURCE_NOT_FOUND')
+        error_debug_id: PayPal debug ID for support tickets
+        details: Full error details from PayPal response
+
+    Example:
+        try:
+            provider.post(None, subscription_url)
+        except PaypalApiError as e:
+            if e.is_not_found():
+                logger.warning(f"Subscription not found (debug: {e.error_debug_id})")
+            elif e.is_already_cancelled():
+                logger.info("Subscription already cancelled")
+    """
+
+    def __init__(
+        self,
+        message,
+        status_code=None,
+        error_name=None,
+        error_debug_id=None,
+        details=None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_name = error_name
+        self.error_debug_id = error_debug_id
+        self.details = details or {}
+
+    def is_not_found(self):
+        """Check if error is because resource doesn't exist."""
+        return self.error_name == "RESOURCE_NOT_FOUND"
+
+    def is_already_cancelled(self):
+        """Check if subscription/order is already cancelled or in invalid state."""
+        return self.error_name in [
+            "UNPROCESSABLE_ENTITY",
+            "SUBSCRIPTION_STATUS_INVALID",
+        ]
+
+    def is_invalid_request(self):
+        """Check if request was malformed."""
+        return self.status_code == 400
+
+
+
 def authorize(fun):
     @wraps(fun)
     def wrapper(*args, **kwargs):
@@ -133,19 +187,35 @@ class PaypalProvider(BasicProvider):
             if payment is not None:
                 self.set_error_data(payment, data)
             logger.debug(data)
-            message = "Paypal error"
-            if response.status_code == 400:
-                error_data = response.json()
-                logger.warning(
-                    message,
-                    extra={"response": error_data, "status_code": response.status_code},
-                )
-                message = error_data.get("message", message)
-            else:
-                logger.warning(message, extra={"status_code": response.status_code})
+
+            # Extract structured error information from PayPal response
+            error_name = data.get("name")
+            error_debug_id = data.get("debug_id")
+            message = data.get("message", "Paypal error")
+            details = data.get("details", [])
+
+            # Log with structured context for debugging
+            logger.warning(
+                "PayPal API error",
+                extra={
+                    "status_code": response.status_code,
+                    "error_name": error_name,
+                    "debug_id": error_debug_id,
+                    "error_message": message,
+                },
+            )
+
             if payment is not None:
                 payment.change_status(PaymentStatus.ERROR, message)
-            raise PaymentError(message)
+
+            # Raise specialized exception with structured error details
+            raise PaypalApiError(
+                message=message,
+                status_code=response.status_code,
+                error_name=error_name,
+                error_debug_id=error_debug_id,
+                details=details,
+            )
         if payment is not None:
             self.set_response_data(payment, data)
         return data

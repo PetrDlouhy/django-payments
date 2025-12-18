@@ -622,3 +622,107 @@ def test_provider_get_with_none_payment_handles_401(paypal_provider):
         # Should have called get twice (initial 401 + retry)
         assert mocked_get.call_count == 2
         assert response_data == expected_get_response_data
+
+
+def test_paypal_api_error_structure(paypal_provider):
+    """Test that PaypalApiError contains structured error information."""
+    test_url = "http://example.com/api/test"
+
+    with patch("requests.post") as mocked_post:
+        # Mock token acquisition
+        token_response = MagicMock()
+        token_response.json.return_value = {
+            "access_token": "test_token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        token_response.status_code = 200
+
+        # Mock 404 error response from PayPal
+        error_response = MagicMock()
+        error_response.json.return_value = {
+            "name": "RESOURCE_NOT_FOUND",
+            "message": "The specified resource does not exist.",
+            "debug_id": "test_debug_id_123",
+            "details": [{
+                "issue": "INVALID_RESOURCE_ID",
+                "description": "Specified resource ID does not exist."
+            }]
+        }
+        error_response.status_code = 404
+
+        mocked_post.side_effect = [token_response, error_response]
+
+        # Import PaypalApiError
+        from payments.paypal import PaypalApiError
+
+        with pytest.raises(PaypalApiError) as exc_info:
+            paypal_provider.post(None, test_url)
+
+        error = exc_info.value
+        assert error.status_code == 404
+        assert error.error_name == "RESOURCE_NOT_FOUND"
+        assert error.error_debug_id == "test_debug_id_123"
+        assert "does not exist" in str(error)
+        assert len(error.details) == 1
+
+
+def test_paypal_api_error_is_not_found():
+    """Test is_not_found() helper method."""
+    from payments.paypal import PaypalApiError
+
+    error = PaypalApiError(
+        message="Not found",
+        status_code=404,
+        error_name="RESOURCE_NOT_FOUND"
+    )
+    assert error.is_not_found() is True
+    assert error.is_already_cancelled() is False
+    assert error.is_invalid_request() is False
+
+
+def test_paypal_api_error_is_already_cancelled():
+    """Test is_already_cancelled() helper method."""
+    from payments.paypal import PaypalApiError
+
+    error = PaypalApiError(
+        message="Unprocessable",
+        status_code=422,
+        error_name="UNPROCESSABLE_ENTITY"
+    )
+    assert error.is_not_found() is False
+    assert error.is_already_cancelled() is True
+    assert error.is_invalid_request() is False
+
+
+def test_paypal_api_error_is_invalid_request():
+    """Test is_invalid_request() helper method."""
+    from payments.paypal import PaypalApiError
+
+    error = PaypalApiError(
+        message="Bad request",
+        status_code=400,
+        error_name="INVALID_REQUEST"
+    )
+    assert error.is_not_found() is False
+    assert error.is_already_cancelled() is False
+    assert error.is_invalid_request() is True
+
+
+def test_paypal_api_error_backward_compatible():
+    """Test that PaypalApiError is backward compatible with PaymentError."""
+    from payments import PaymentError
+    from payments.paypal import PaypalApiError
+
+    error = PaypalApiError(
+        message="Test error",
+        status_code=400,
+        error_name="TEST_ERROR"
+    )
+
+    # Should be catchable as PaymentError
+    assert isinstance(error, PaymentError)
+
+    # Should have message accessible in standard ways
+    assert str(error) == "Test error"
+    assert error.args[0] == "Test error"
