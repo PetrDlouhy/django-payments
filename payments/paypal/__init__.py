@@ -96,6 +96,9 @@ def authorize(fun):
             response = fun(*args, **kwargs)
         except HTTPError as e:
             if e.response.status_code == 401:
+                # Clear instance cache on 401 error
+                self._cached_token = None
+                self._cached_token_expires = None
                 if payment is not None:
                     last_auth_response = self.get_last_response(payment, is_auth=True)
                     if "access_token" in last_auth_response:
@@ -137,6 +140,9 @@ class PaypalProvider(BasicProvider):
         self.payment_refund_url = (
             self.endpoint + "/v1/payments/capture/{captureId}/refund"
         )
+        # Token caching for payment=None requests
+        self._cached_token = None
+        self._cached_token_expires = None
         super().__init__(capture=capture)
 
     def set_response_data(self, payment, response, is_auth=False):
@@ -261,19 +267,46 @@ class PaypalProvider(BasicProvider):
         return extra_data.get("response", {})
 
     def get_access_token(self, payment):
+        """Get PayPal access token with instance-level caching.
+
+        Caching strategy:
+        1. Check instance-level cache first (works for payment=None)
+        2. If payment provided, check payment-based cache (backward compatibility)
+        3. Fetch new token if no valid cache
+        4. Store in both instance cache and payment (if provided)
+
+        This enables efficient token reuse across multiple payment=None API calls
+        (e.g., subscription management) while maintaining backward compatibility.
+        """
+        now = timezone.now()
+
+        # Check instance-level cache first (works for payment=None)
+        if (
+            self._cached_token is not None
+            and self._cached_token_expires is not None
+            and self._cached_token_expires > now
+        ):
+            return self._cached_token
+
+        # Check payment-based cache (backward compatibility)
         if payment is not None:
             last_auth_response = self.get_last_response(payment, is_auth=True)
             created = payment.created
-            now = timezone.now()
             expires_in = last_auth_response.get("expires_in")
             if (
                 "access_token" in last_auth_response
                 and expires_in is not None
                 and (created + timedelta(seconds=expires_in)) > now
             ):
-                return "{} {}".format(
+                token = "{} {}".format(
                     last_auth_response["token_type"], last_auth_response["access_token"]
                 )
+                # Update instance cache from payment cache
+                self._cached_token = token
+                self._cached_token_expires = created + timedelta(seconds=expires_in)
+                return token
+
+        # Fetch new token
         headers = {"Accept": "application/json", "Accept-Language": "en_US"}
         post = {"grant_type": "client_credentials"}
         response = requests.post(
@@ -284,10 +317,20 @@ class PaypalProvider(BasicProvider):
         )
         response.raise_for_status()
         data = response.json()
+
+        # Store in instance cache
+        token = "{} {}".format(data["token_type"], data["access_token"])
+        expires_in = data.get("expires_in", 3600)  # Default 1 hour
+        self._cached_token = token
+        self._cached_token_expires = now + timedelta(seconds=expires_in)
+
+        # Also store in payment if provided (backward compatibility)
         if payment is not None:
+            last_auth_response = self.get_last_response(payment, is_auth=True)
             last_auth_response.update(data)
             self.set_response_data(payment, last_auth_response, is_auth=True)
-        return "{} {}".format(data["token_type"], data["access_token"])
+
+        return token
 
     def get_transactions_items(self, payment):
         for purchased_item in payment.get_purchased_items():

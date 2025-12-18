@@ -726,3 +726,184 @@ def test_paypal_api_error_backward_compatible():
     # Should have message accessible in standard ways
     assert str(error) == "Test error"
     assert error.args[0] == "Test error"
+
+
+def test_token_caching_with_payment_none(paypal_provider):
+    """Test that tokens are cached at instance level for payment=None calls."""
+    test_url = "http://example.com/api/test"
+    expected_token = "test_access_token"
+    expected_token_type = "Bearer"
+
+    with patch("requests.post") as mocked_post, patch("requests.get") as mocked_get:
+        # Mock token acquisition
+        token_response = MagicMock()
+        token_response.json.return_value = {
+            "access_token": expected_token,
+            "token_type": expected_token_type,
+            "expires_in": 3600,
+        }
+        token_response.status_code = 200
+
+        # Mock GET response
+        get_response = MagicMock()
+        get_response.json.return_value = {"status": "success"}
+        get_response.status_code = 200
+
+        mocked_post.return_value = token_response
+        mocked_get.return_value = get_response
+
+        # First call - should fetch token
+        result1 = paypal_provider.get(None, test_url)
+        assert result1 == {"status": "success"}
+        assert mocked_post.call_count == 1  # Token fetched
+
+        # Second call - should reuse cached token
+        result2 = paypal_provider.get(None, test_url)
+        assert result2 == {"status": "success"}
+        assert mocked_post.call_count == 1  # Token NOT fetched again (cached!)
+
+        # Third call - should still use cached token
+        result3 = paypal_provider.post(None, test_url, data={"test": "data"})
+        assert mocked_post.call_count == 2  # One for POST, no new token fetch
+
+
+def test_token_caching_expires_correctly(paypal_provider):
+    """Test that expired tokens trigger re-fetch."""
+    from datetime import timedelta
+
+    test_url = "http://example.com/api/test"
+    token_response1 = MagicMock()
+    token_response1.json.return_value = {
+        "access_token": "token1",
+        "token_type": "Bearer",
+        "expires_in": 0,  # Expires immediately
+    }
+    token_response1.status_code = 200
+
+    token_response2 = MagicMock()
+    token_response2.json.return_value = {
+        "access_token": "token2",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    token_response2.status_code = 200
+
+    get_response = MagicMock()
+    get_response.json.return_value = {"status": "success"}
+    get_response.status_code = 200
+
+    with patch("requests.post") as mocked_post, patch("requests.get") as mocked_get:
+        mocked_post.side_effect = [token_response1, token_response2]
+        mocked_get.return_value = get_response
+
+        # First call - fetches token1 (expires immediately)
+        paypal_provider.get(None, test_url)
+        assert mocked_post.call_count == 1
+
+        # Simulate time passing - token should be expired
+        # Force expiry by setting it to past
+        paypal_provider._cached_token_expires = timezone.now() - timedelta(seconds=10)
+
+        # Second call - should fetch new token
+        paypal_provider.get(None, test_url)
+        assert mocked_post.call_count == 2  # New token fetched
+
+
+def test_token_caching_with_payment_instance(paypal_payment, paypal_provider):
+    """Test backward compatibility: payment-based cache still works."""
+    test_url = "http://example.com/api/test"
+    expected_token = "test_token"
+
+    with patch("requests.post") as mocked_post, patch("requests.get") as mocked_get:
+        token_response = MagicMock()
+        token_response.json.return_value = {
+            "access_token": expected_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        token_response.status_code = 200
+
+        get_response = MagicMock()
+        get_response.json.return_value = {"status": "success"}
+        get_response.status_code = 200
+
+        mocked_post.return_value = token_response
+        mocked_get.return_value = get_response
+
+        # First call with payment - fetches and caches token
+        result1 = paypal_provider.get(paypal_payment, test_url)
+        assert result1 == {"status": "success"}
+        assert mocked_post.call_count == 1
+
+        # Second call with same payment - uses cached token
+        result2 = paypal_provider.get(paypal_payment, test_url)
+        assert result2 == {"status": "success"}
+        assert mocked_post.call_count == 1  # Token reused
+
+
+def test_token_cache_shared_between_payment_and_none(paypal_payment, paypal_provider):
+    """Test that token cache is shared between payment and payment=None calls."""
+    test_url = "http://example.com/api/test"
+    expected_token = "shared_token"
+
+    with patch("requests.post") as mocked_post, patch("requests.get") as mocked_get:
+        token_response = MagicMock()
+        token_response.json.return_value = {
+            "access_token": expected_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        token_response.status_code = 200
+
+        get_response = MagicMock()
+        get_response.json.return_value = {"status": "success"}
+        get_response.status_code = 200
+
+        mocked_post.return_value = token_response
+        mocked_get.return_value = get_response
+
+        # First call with payment - fetches token and stores in both caches
+        paypal_provider.get(paypal_payment, test_url)
+        assert mocked_post.call_count == 1
+
+        # Second call with payment=None - should use instance cache
+        paypal_provider.get(None, test_url)
+        assert mocked_post.call_count == 1  # Token reused from instance cache
+
+        # Third call with payment - should use instance cache
+        paypal_provider.get(paypal_payment, test_url)
+        assert mocked_post.call_count == 1  # Token still reused
+
+
+def test_multiple_payment_none_calls_performance(paypal_provider):
+    """Test that multiple payment=None calls only fetch token once."""
+    test_urls = [
+        "http://example.com/api/subscriptions/1",
+        "http://example.com/api/subscriptions/2",
+        "http://example.com/api/subscriptions/3",
+    ]
+
+    with patch("requests.post") as mocked_post, patch("requests.get") as mocked_get:
+        token_response = MagicMock()
+        token_response.json.return_value = {
+            "access_token": "token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        token_response.status_code = 200
+
+        get_response = MagicMock()
+        get_response.json.return_value = {"subscription": "data"}
+        get_response.status_code = 200
+
+        mocked_post.return_value = token_response
+        mocked_get.return_value = get_response
+
+        # Make multiple API calls - token should only be fetched once
+        for url in test_urls:
+            paypal_provider.get(None, url)
+
+        # Verify token was only fetched once
+        assert mocked_post.call_count == 1
+        # Verify all GET calls were made
+        assert mocked_get.call_count == 3
