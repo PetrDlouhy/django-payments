@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from decimal import Decimal
 from urllib.parse import urljoin
 
 import requests
@@ -15,13 +15,19 @@ from payments import RedirectNeeded
 from payments.core import BasicProvider
 from payments.core import get_base_url
 
-if TYPE_CHECKING:
-    from decimal import Decimal
-
 logger = logging.getLogger(__name__)
 
 TOKEN_EXPIRY_SAFETY_MARGIN_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30
+
+
+class WalletTokenRevoked(PaymentError):
+    """PayPal no longer holds the vaulted payment method for this payer.
+
+    Raised instead of a plain error status so the caller can disarm
+    automatic billing: every future charge against this token fails the
+    same way, and retrying it forever only accumulates failed payments.
+    """
 
 
 class PaypalPPCPProvider(BasicProvider):
@@ -252,9 +258,10 @@ class PaypalPPCPProvider(BasicProvider):
             return redirect(payment.get_failure_url())
 
         capture = self._extract_capture(capture_data)
-        payment.transaction_id = capture["id"]
-        payment.captured_amount = payment.total
-        payment.save()
+        if capture.get("status") != "COMPLETED":
+            self._hold_pending_capture(payment, capture)
+            return redirect(payment.get_success_url())
+        self._book_capture(payment, capture)
 
         vault_data = (
             capture_data.get("payment_source", {})
@@ -281,7 +288,157 @@ class PaypalPPCPProvider(BasicProvider):
             f"order {capture_data.get('id')}"
         )
 
+    def _book_capture(self, payment, capture) -> None:
+        """Persist the settled capture's bookkeeping on the payment.
+
+        Saves explicitly because a later ``change_status()`` persists only
+        status and message. Subclasses can override this to store extra
+        bookkeeping from the capture object — e.g. the PayPal fee at
+        ``capture["seller_receivable_breakdown"]["paypal_fee"]``.
+        """
+        payment.transaction_id = capture["id"]
+        payment.captured_amount = payment.total
+        payment.save()
+
+    def _hold_pending_capture(self, payment, capture) -> None:
+        """Keep a payment whose capture has not settled in WAITING.
+
+        A capture can come back ``PENDING`` (eCheck funding, risk review)
+        even when the order reports ``COMPLETED``. The money has not
+        arrived, so nothing is booked and the payment must not confirm.
+        The capture id is persisted so the payment can be reconciled once
+        PayPal settles the capture.
+        """
+        payment.transaction_id = capture.get("id", "")
+        payment.save()
+        reason = capture.get("status_details", {}).get("reason")
+        message = f"PayPal capture {capture.get('status')}" + (
+            f": {reason}" if reason else ""
+        )
+        logger.warning(
+            "Payment %s: %s -- awaiting settlement, nothing booked",
+            payment.pk,
+            message,
+        )
+        payment.change_status(PaymentStatus.WAITING, message)
+
+    # -- webhook events ----------------------------------------------------
+
+    def apply_capture_webhook(self, payment, capture) -> str | None:
+        """Apply a ``PAYMENT.CAPTURE.*`` webhook resource to the payment.
+
+        This is how an unsettled capture (eCheck funding, risk review)
+        eventually resolves, and how a capture PayPal denies or reverses
+        after the fact reaches the integration - neither shows up in the
+        synchronous return flow. Returns the new status, or ``None`` when
+        the event required no change.
+
+        A confirmed payment is never demoted by a later DENIED event:
+        PayPal can deliver events out of order, and only a genuine refund
+        may move a payment out of confirmed.
+
+        Webhook *transport* (signature verification, payment lookup) is the
+        integration's business - see the webhook section in the docs.
+        """
+        status = capture.get("status")
+        self._set_attr(payment, "ppcp_capture_webhook", capture)
+
+        if status == "COMPLETED":
+            if payment.status == PaymentStatus.CONFIRMED:
+                payment.save()
+                return None
+            self._book_capture(payment, capture)
+            payment.change_status(PaymentStatus.CONFIRMED)
+            self._finalize_wallet_payment(payment)
+            return PaymentStatus.CONFIRMED
+
+        if status in ("DENIED", "FAILED", "DECLINED"):
+            if payment.status == PaymentStatus.CONFIRMED:
+                logger.warning(
+                    "Ignoring PayPal %s webhook for already-confirmed payment %s",
+                    status,
+                    payment.pk,
+                )
+                payment.save()
+                return None
+            payment.save()
+            payment.change_status(PaymentStatus.REJECTED, f"PayPal capture {status}")
+            return PaymentStatus.REJECTED
+
+        if status == "PENDING":
+            self._hold_pending_capture(payment, capture)
+            return PaymentStatus.WAITING
+
+        logger.info(
+            "Unhandled PayPal capture status %s for payment %s", status, payment.pk
+        )
+        payment.save()
+        return None
+
+    def apply_refund_webhook(self, payment, refund) -> str | None:
+        """Apply a ``PAYMENT.CAPTURE.REFUNDED`` webhook resource to the payment.
+
+        Only a refund of the whole captured amount flips the payment to
+        REFUNDED; a partial refund is recorded and logged for a human,
+        because the payment model has no partial-refund state to move to.
+        """
+        self._set_attr(payment, "ppcp_refund_webhook", refund)
+        payment.save()
+
+        amount = refund.get("amount", {}).get("value")
+        refunded = Decimal(amount) if amount is not None else None
+
+        if refunded is not None and refunded < payment.captured_amount:
+            logger.warning(
+                "Partial PayPal refund %s of %s for payment %s - needs manual"
+                " reconciliation",
+                refunded,
+                payment.captured_amount,
+                payment.pk,
+            )
+            return None
+
+        payment.change_status(PaymentStatus.REFUNDED, "Refunded at PayPal")
+        return PaymentStatus.REFUNDED
+
     # -- wallet interface (server-initiated recurring charges) -------------
+
+    @staticmethod
+    def _renewal_request_id(payment, step: str) -> str:
+        """PayPal-Request-Id for a merchant-initiated renewal call.
+
+        The default is scoped to the payment instance. Integrations whose
+        retry logic creates a NEW payment row per attempt should override
+        this with a key derived from what is being paid (and, typically, the
+        calendar day): keyed on the row, a retry after a timeout is a fresh
+        request and double-charges when the timed-out call actually reached
+        PayPal; keyed on the target, PayPal replays the original result.
+        """
+        return f"renew-{step}-{payment.token}"
+
+    @staticmethod
+    def _is_token_gone(error: requests.HTTPError) -> bool:
+        """True when PayPal says the vaulted payment method itself is gone.
+
+        Deliberately narrow: only a 404 on the token resource counts,
+        because a false positive disarms a paying customer's automatic
+        billing. Declines, rate limits and outages stay transient errors.
+        The issue codes are logged so integrations can widen this from real
+        production data.
+        """
+        response = getattr(error, "response", None)
+        if response is None:
+            return False
+        try:
+            details = response.json().get("details", [])
+        except ValueError:
+            details = []
+        issues = [d.get("issue") for d in details if isinstance(d, dict)]
+        if issues:
+            logger.warning(
+                "PayPal renewal error %s, issues: %s", response.status_code, issues
+            )
+        return response.status_code == 404
 
     def autocomplete_with_wallet(self, payment) -> None:
         """Charge the vaulted PayPal payment token (merchant-initiated)."""
@@ -297,18 +454,37 @@ class PaypalPPCPProvider(BasicProvider):
         }
         try:
             order_data = self.api_post(
-                self.orders_url, body, request_id=f"renew-{payment.token}"
+                self.orders_url,
+                body,
+                request_id=self._renewal_request_id(payment, "order"),
             )
         except requests.HTTPError as e:
+            if self._is_token_gone(e):
+                payment.change_status(
+                    PaymentStatus.ERROR, "PayPal payment method no longer available"
+                )
+                raise WalletTokenRevoked(
+                    f"PayPal vault token for payment {payment.pk} no longer exists"
+                ) from e
             payment.change_status(PaymentStatus.ERROR, f"PayPal renewal failed: {e}")
             return
         self._set_attr(payment, "ppcp_order", order_data)
+        payment.save()
         if order_data.get("status") != "COMPLETED":
             # Some accounts return CREATED and need an explicit capture step.
-            order_data = self.api_post(
-                f"{self.orders_url}/{order_data['id']}/capture",
-                request_id=f"renew-capture-{payment.token}",
-            )
+            # Wrapped like the order call above: an unhandled error here would
+            # escape into whatever schedules the renewals and could abort a
+            # whole batch of unrelated accounts.
+            try:
+                order_data = self.api_post(
+                    f"{self.orders_url}/{order_data['id']}/capture",
+                    request_id=self._renewal_request_id(payment, "capture"),
+                )
+            except requests.HTTPError as e:
+                payment.change_status(
+                    PaymentStatus.ERROR, f"PayPal renewal capture failed: {e}"
+                )
+                return
         self._set_attr(payment, "ppcp_capture", order_data)
         if order_data.get("status") != "COMPLETED":
             payment.save()
@@ -318,10 +494,10 @@ class PaypalPPCPProvider(BasicProvider):
             )
             return
         capture = self._extract_capture(order_data)
-        payment.transaction_id = capture["id"]
-        payment.captured_amount = payment.total
-        # Persist bookkeeping before change_status's partial save (see above).
-        payment.save()
+        if capture.get("status") != "COMPLETED":
+            self._hold_pending_capture(payment, capture)
+            return
+        self._book_capture(payment, capture)
         payment.change_status(PaymentStatus.CONFIRMED)
         self._finalize_wallet_payment(payment)
 

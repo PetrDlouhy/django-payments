@@ -193,7 +193,25 @@ Differences to check before switching:
   ``response``/``links`` keys. Code that parses ``extra_data`` directly
   (e.g. fee extraction) must read the new keys — the PayPal fee is at
   ``ppcp_capture.purchase_units[0].payments.captures[0]
-  .seller_receivable_breakdown.paypal_fee``.
+  .seller_receivable_breakdown.paypal_fee``. Alternatively, subclass the
+  provider and override ``_book_capture(payment, capture)``, which
+  receives the settled capture object — the natural place to store the
+  fee or other per-capture bookkeeping on your payment model.
+* **Unsettled captures stay WAITING**: a capture can come back
+  ``PENDING`` (eCheck funding, risk review) even when the order reports
+  ``COMPLETED``. The payment is then kept in ``WAITING`` with the PayPal
+  reason in ``message`` and nothing booked — it is *not* confirmed,
+  since the money has not arrived. Resolve such payments by feeding the
+  ``PAYMENT.CAPTURE.*`` webhook events to
+  ``apply_capture_webhook(payment, resource)`` /
+  ``apply_refund_webhook(payment, resource)``; webhook transport
+  (endpoint, signature verification via PayPal's
+  ``verify-webhook-signature``, looking the payment up by the capture id
+  stored in ``transaction_id``) is the integration's business.
+* **Revoked payment methods raise** ``WalletTokenRevoked`` from
+  ``autocomplete_with_wallet()`` when PayPal reports the vaulted token
+  gone (a 404 on the token), so the integration can disarm automatic
+  billing instead of retrying a dead token on every schedule slot.
 * **Endpoint host**: use ``https://api-m.paypal.com`` (or
   ``https://api-m.sandbox.paypal.com``).
 
